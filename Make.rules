@@ -1,0 +1,19 @@
+$(BUILDDIR)/%.c.o: src/%.c
+	$(MKCWD)
+	@echo "  CC    $<"
+	@$(CC) $(CFLAGS) -MMD -MP -MF $(BUILDDIR)/$*.c.d -c -o $@ $<
+
+$(BUILDDIR)/%.S.o: src/%.S
+	$(MKCWD)
+	@echo "  AS    $<"
+	@$(AS) $(ASFLAGS) -MMD -MP -MF $(BUILDDIR)/$*.S.d -c -o $@ $<
+
+$(BINDIR)/%.a: $(OBJ)
+	$(MKCWD)
+	@echo "  AR    $@"
+	@$(AR) rcs $@ $^
+
+$(BINDIR)/%: $(OBJ)
+	$(MKCWD)
+	@echo "  LD    $@"
+	@$(LD) -o $@ $^ $(LDFLAGS) $(LDSTDLIB)

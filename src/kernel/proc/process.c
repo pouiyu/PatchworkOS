@@ -1,0 +1,399 @@
+#include <kernel/cpu/cpu.h>
+#include <kernel/cpu/gdt.h>
+#include <kernel/fs/ctl.h>
+#include <kernel/fs/dentry.h>
+#include <kernel/fs/devfs.h>
+#include <kernel/fs/file.h>
+#include <kernel/fs/namespace.h>
+#include <kernel/fs/path.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/io/io.h>
+#include <kernel/log/log.h>
+#include <kernel/log/panic.h>
+#include <kernel/mem/cache.h>
+#include <kernel/mem/vmm.h>
+#include <kernel/proc/group.h>
+#include <kernel/proc/process.h>
+#include <kernel/proc/reaper.h>
+#include <kernel/sched/clock.h>
+#include <kernel/sched/sched.h>
+#include <kernel/sched/thread.h>
+#include <kernel/sched/timer.h>
+#include <kernel/sched/wait.h>
+#include <kernel/sync/lock.h>
+#include <kernel/sync/rcu.h>
+
+#include <assert.h>
+#include <errno.h>
+#include <kernel/sync/seqlock.h>
+#include <kernel/utils/map.h>
+#include <kernel/utils/ref.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/fs.h>
+#include <sys/list.h>
+#include <sys/math.h>
+#include <sys/proc.h>
+
+static process_t* kernelProcess = NULL;
+
+static _Atomic(pid_t) newPid = ATOMIC_VAR_INIT(0);
+
+static map_t pidMap = MAP_CREATE();
+
+list_t _processes = LIST_CREATE(_processes);
+static lock_t processesLock = LOCK_CREATE();
+
+static void process_ctor(void* ptr)
+{
+    process_t* process = (process_t*)ptr;
+
+    process->ref = (ref_t){0};
+    list_entry_init(&process->entry);
+    map_entry_init(&process->mapEntry);
+    list_entry_init(&process->zombieEntry);
+    process->id = 0;
+    atomic_init(&process->priority, 0);
+    memset_s(process->status.buffer, PROCESS_STATUS_MAX, 0, PROCESS_STATUS_MAX);
+    lock_init(&process->status.lock);
+    process->space = (space_t){0};
+    process->nspace = NULL;
+    lock_init(&process->nspaceLock);
+    process->cwd = (cwd_t){0};
+    process->fileTable = (file_table_t){0};
+    process->futexCtx = (futex_ctx_t){0};
+    process->perf = (perf_process_ctx_t){0};
+    process->noteHandler = (note_handler_t){0};
+    process->suspendQueue = (wait_queue_t){0};
+    process->dyingQueue = (wait_queue_t){0};
+    atomic_init(&process->flags, PROCESS_NONE);
+    atomic_init(&process->threads.newTid, 0);
+    list_init(&process->threads.list);
+    process->threads.count = 0;
+    lock_init(&process->threads.lock);
+    env_init(&process->env);
+    process->argv = NULL;
+    process->argc = 0;
+    process->group = (group_member_t){0};
+    process->rcu = (rcu_entry_t){0};
+}
+
+static cache_t cache = CACHE_CREATE(cache, "process", sizeof(process_t), CACHE_LINE, process_ctor, NULL);
+
+static void process_free(process_t* process)
+{
+    LOG_DEBUG("freeing process pid=%d\n", process->id);
+
+    assert(list_is_empty(&process->threads.list));
+
+    if (process->argv != NULL)
+    {
+        for (uint64_t i = 0; i < process->argc; i++)
+        {
+            if (process->argv[i] != NULL)
+            {
+                free(process->argv[i]);
+            }
+        }
+        free((void*)process->argv);
+        process->argv = NULL;
+        process->argc = 0;
+    }
+
+    group_member_deinit(&process->group);
+    cwd_deinit(&process->cwd);
+    file_table_deinit(&process->fileTable);
+    if (process->nspace != NULL)
+    {
+        UNREF(process->nspace);
+    }
+    space_deinit(&process->space);
+    futex_ctx_deinit(&process->futexCtx);
+    for (uint64_t i = 0; i < ARRAY_SIZE(process->rings); i++)
+    {
+        ioring_ctx_deinit(&process->rings[i]);
+    }
+    wait_queue_deinit(&process->dyingQueue);
+    wait_queue_deinit(&process->suspendQueue);
+    env_deinit(&process->env);
+
+    rcu_call(&process->rcu, rcu_call_cache_free, process);
+}
+
+process_t* process_new(priority_t priority, group_member_t* group, namespace_t* ns)
+{
+    if (ns == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    process_t* process = cache_alloc(&cache);
+    if (process == NULL)
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    ref_init(&process->ref, process_free);
+    process->id = atomic_fetch_add_explicit(&newPid, 1, memory_order_relaxed);
+    atomic_store(&process->priority, priority);
+    process->status.buffer[0] = '\0';
+
+    if (space_init(&process->space, VMM_USER_SPACE_MIN, VMM_USER_SPACE_MAX,
+            SPACE_MAP_KERNEL_BINARY | SPACE_MAP_KERNEL_HEAP | SPACE_MAP_IDENTITY) == ERR)
+    {
+        cache_free(process);
+        return NULL;
+    }
+
+    process->nspace = REF(ns);
+    cwd_init(&process->cwd);
+    file_table_init(&process->fileTable);
+    futex_ctx_init(&process->futexCtx);
+    perf_process_ctx_init(&process->perf);
+    for (uint64_t i = 0; i < ARRAY_SIZE(process->rings); i++)
+    {
+        ioring_ctx_init(&process->rings[i]);
+    }
+    note_handler_init(&process->noteHandler);
+    wait_queue_init(&process->suspendQueue);
+    wait_queue_init(&process->dyingQueue);
+    atomic_store(&process->flags, PROCESS_NONE);
+    atomic_store(&process->threads.newTid, 0);
+    lock_init(&process->threads.lock);
+    env_init(&process->env);
+
+    if (group_member_init(&process->group, group) == ERR)
+    {
+        process_free(process);
+        return NULL;
+    }
+
+    lock_acquire(&processesLock);
+
+    map_key_t mapKey = map_key_uint64(process->id);
+    if (map_insert(&pidMap, &mapKey, &process->mapEntry) == ERR)
+    {
+        lock_release(&processesLock);
+        process_free(process);
+        return NULL;
+    }
+
+    LOG_DEBUG("created process pid=%d\n", process->id);
+
+    list_push_back_rcu(&_processes, &process->entry);
+    lock_release(&processesLock);
+    return REF(process);
+}
+
+process_t* process_get(pid_t id)
+{
+    RCU_READ_SCOPE();
+
+    map_key_t mapKey = map_key_uint64(id);
+    map_entry_t* entry = map_get(&pidMap, &mapKey);
+    if (entry == NULL)
+    {
+        return NULL;
+    }
+
+    return REF_TRY(CONTAINER_OF(entry, process_t, mapEntry));
+}
+
+namespace_t* process_get_ns(process_t* process)
+{
+    if (process == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    lock_acquire(&process->nspaceLock);
+    namespace_t* ns = process->nspace != NULL ? REF(process->nspace) : NULL;
+    lock_release(&process->nspaceLock);
+
+    if (ns == NULL)
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    return ns;
+}
+
+void process_set_ns(process_t* process, namespace_t* ns)
+{
+    if (process == NULL || ns == NULL)
+    {
+        return;
+    }
+
+    lock_acquire(&process->nspaceLock);
+    UNREF(process->nspace);
+    process->nspace = REF(ns);
+    lock_release(&process->nspaceLock);
+}
+
+void process_kill(process_t* process, const char* status)
+{
+    if (atomic_fetch_or(&process->flags, PROCESS_DYING) & PROCESS_DYING)
+    {
+        return;
+    }
+
+    lock_acquire(&process->status.lock);
+    strncpy(process->status.buffer, status, PROCESS_STATUS_MAX - 1);
+    process->status.buffer[PROCESS_STATUS_MAX - 1] = '\0';
+    lock_release(&process->status.lock);
+
+    RCU_READ_SCOPE();
+
+    uint64_t killCount = 0;
+    thread_t* thread;
+    PROCESS_RCU_THREAD_FOR_EACH(thread, process)
+    {
+        thread_send_note(thread, "kill");
+        killCount++;
+    }
+
+    if (killCount > 0)
+    {
+        LOG_DEBUG("sent kill note to %llu threads in process pid=%d\n", killCount, process->id);
+    }
+
+    // Anything that another process could be waiting on must be cleaned up here.
+
+    cwd_clear(&process->cwd);
+    file_table_close_all(&process->fileTable);
+
+    lock_acquire(&process->nspaceLock);
+    UNREF(process->nspace);
+    process->nspace = NULL;
+    lock_release(&process->nspaceLock);
+
+    group_remove(&process->group);
+
+    wait_unblock(&process->dyingQueue, WAIT_ALL, EOK);
+
+    reaper_push(process);
+}
+
+void process_remove(process_t* process)
+{
+    lock_acquire(&processesLock);
+    map_remove(&pidMap, &process->mapEntry);
+    list_remove_rcu(&process->entry);
+    lock_release(&processesLock);
+
+    UNREF(process);
+}
+
+uint64_t process_set_cmdline(process_t* process, char** argv, uint64_t argc)
+{
+    if (process == NULL)
+    {
+        errno = EINVAL;
+        return ERR;
+    }
+
+    if (argv == NULL || argc == 0)
+    {
+        process->argv = NULL;
+        process->argc = 0;
+        return 0;
+    }
+
+    char** newArgv = malloc(sizeof(char*) * (argc + 1));
+    if (newArgv == NULL)
+    {
+        errno = ENOMEM;
+        return ERR;
+    }
+
+    uint64_t i = 0;
+    for (; i < argc; i++)
+    {
+        if (argv[i] == NULL)
+        {
+            break;
+        }
+        size_t len = strlen(argv[i]) + 1;
+        newArgv[i] = malloc(len);
+        if (newArgv[i] == NULL)
+        {
+            for (uint64_t j = 0; j < i; j++)
+            {
+                free(newArgv[j]);
+            }
+            free(newArgv);
+            errno = ENOMEM;
+            return ERR;
+        }
+        memcpy(newArgv[i], argv[i], len);
+    }
+    newArgv[i] = NULL;
+
+    uint64_t newArgc = i;
+    if (process->argv != NULL)
+    {
+        for (uint64_t j = 0; j < process->argc; j++)
+        {
+            if (process->argv[j] != NULL)
+            {
+                free(process->argv[j]);
+            }
+        }
+        free(process->argv);
+    }
+
+    process->argv = newArgv;
+    process->argc = newArgc;
+
+    return 0;
+}
+
+bool process_has_thread(process_t* process, tid_t tid)
+{
+    RCU_READ_SCOPE();
+
+    thread_t* thread;
+    PROCESS_RCU_THREAD_FOR_EACH(thread, process)
+    {
+        if (thread->id == tid)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+process_t* process_get_kernel(void)
+{
+    if (kernelProcess == NULL)
+    {
+        namespace_t* ns = namespace_new(NULL);
+        if (ns == NULL)
+        {
+            panic(NULL, "Failed to create kernel namespace");
+        }
+        UNREF_DEFER(ns);
+
+        kernelProcess = process_new(PRIORITY_MAX, NULL, ns);
+        if (kernelProcess == NULL)
+        {
+            panic(NULL, "Failed to create kernel process");
+        }
+        LOG_INFO("kernel process initialized with pid=%d\n", kernelProcess->id);
+    }
+
+    return kernelProcess;
+}
+
+SYSCALL_DEFINE(SYS_GETPID, pid_t)
+{
+    return process_current()->id;
+}

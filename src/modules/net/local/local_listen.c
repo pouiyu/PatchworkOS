@@ -1,0 +1,113 @@
+#include "local_listen.h"
+#include "local.h"
+#include "local_conn.h"
+
+#include <kernel/fs/devfs.h>
+#include <kernel/log/log.h>
+#include <kernel/log/panic.h>
+#include <kernel/sched/wait.h>
+#include <kernel/sync/lock.h>
+#include <kernel/sync/rwlock.h>
+#include <kernel/utils/map.h>
+
+#include <stdlib.h>
+#include <sys/list.h>
+
+static map_t listeners = MAP_CREATE();
+static rwlock_t listenersLock = RWLOCK_CREATE();
+
+local_listen_t* local_listen_new(const char* address)
+{
+    if (address == NULL || *address == '\0')
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    local_listen_t* listen = malloc(sizeof(local_listen_t));
+    if (listen == NULL)
+    {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    ref_init(&listen->ref, local_listen_free);
+    map_entry_init(&listen->entry);
+    strncpy(listen->address, address, sizeof(listen->address));
+    listen->address[sizeof(listen->address) - 1] = '\0';
+    list_init(&listen->backlog);
+    listen->pendingAmount = 0;
+    listen->maxBacklog = LOCAL_MAX_BACKLOG;
+    listen->isClosed = false;
+    lock_init(&listen->lock);
+    wait_queue_init(&listen->waitQueue);
+
+    RWLOCK_WRITE_SCOPE(&listenersLock);
+
+    map_key_t key = map_key_string(listen->address);
+    if (map_get(&listeners, &key) != NULL)
+    {
+        wait_queue_deinit(&listen->waitQueue);
+        free(listen);
+
+        errno = EADDRINUSE;
+        return NULL;
+    }
+
+    if (map_insert(&listeners, &key, &listen->entry) == ERR)
+    {
+        wait_queue_deinit(&listen->waitQueue);
+        free(listen);
+        return NULL;
+    }
+
+    return listen;
+}
+
+void local_listen_free(local_listen_t* listen)
+{
+    if (listen == NULL)
+    {
+        return;
+    }
+
+    rwlock_write_acquire(&listenersLock);
+    map_remove(&listeners, &listen->entry);
+    rwlock_write_release(&listenersLock);
+
+    local_conn_t* temp;
+    local_conn_t* conn;
+    LIST_FOR_EACH_SAFE(conn, temp, &listen->backlog, entry)
+    {
+        list_remove(&conn->entry);
+        lock_acquire(&conn->lock);
+        conn->isClosed = true;
+        wait_unblock(&conn->waitQueue, WAIT_ALL, EOK);
+        lock_release(&conn->lock);
+        UNREF(conn);
+    }
+
+    wait_queue_deinit(&listen->waitQueue);
+    free(listen);
+}
+
+local_listen_t* local_listen_find(const char* address)
+{
+    if (address == NULL || *address == '\0')
+    {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    RWLOCK_READ_SCOPE(&listenersLock);
+
+    map_key_t key = map_key_string(address);
+    map_entry_t* entry = map_get(&listeners, &key);
+    if (entry == NULL)
+    {
+        return NULL;
+    }
+
+    local_listen_t* listen = CONTAINER_OF(entry, local_listen_t, entry);
+    return REF(listen);
+}
