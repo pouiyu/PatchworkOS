@@ -135,7 +135,7 @@ static uint64_t taskbar_update_clock(element_t* elem)
     struct tm timeData;
     localtime_r(&epoch, &timeData);
     char buffer[MAX_PATH];
-    sprintf(buffer, "%02d:%02d %d-%02d-%02d", timeData.tm_hour, timeData.tm_min, timeData.tm_year + 1900,
+    sprintf(buffer, "%02d:%02d %d-%02d-%02d", timeData.tm_hour+7, timeData.tm_min, timeData.tm_year + 1900,
         timeData.tm_mon + 1, timeData.tm_mday);
     element_t* clockLabel = element_find(elem, CLOCK_LABEL_ID);
 

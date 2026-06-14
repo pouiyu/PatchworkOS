@@ -304,3 +304,4 @@ run: $(IMAGE)
   -drive if=pflash,format=raw,unit=1,file=lib/OVMFbin/OVMF_VARS-pure-efi.fd \
   -display sdl -serial stdio \
   -no-shutdown -no-reboot
+# make -j$(nproc)

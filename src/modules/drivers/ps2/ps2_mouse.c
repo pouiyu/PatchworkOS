@@ -9,12 +9,12 @@ static void ps2_mouse_handle_packet(mouse_t* mouse, ps2_mouse_t* ps2)
 {
     if (ps2->current.deltaX != 0)
     {
-        mouse_move_x(mouse, ps2->current.deltaX);
+        mouse_move_x(mouse, -ps2->current.deltaX);
     }
 
     if (ps2->current.deltaY != 0)
     {
-        mouse_move_y(mouse, -ps2->current.deltaY);
+        mouse_move_y(mouse, ps2->current.deltaY);
     }
 
     if ((ps2->prev.flags & PS2_PACKET_BUTTON_LEFT) != (ps2->current.flags & PS2_PACKET_BUTTON_LEFT))
