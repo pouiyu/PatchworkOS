@@ -293,3 +293,14 @@ run: $(IMAGE)
 .SECONDARY:
 
 .SILENT:
+
+#qemu-system-x86_64 \
+  -M q35 \
+  -drive format=raw,file=bin/PatchworkOS.img \
+  -m 2G \
+  -smp $(nproc) \
+  -cpu qemu64 \
+  -drive if=pflash,format=raw,unit=0,file=lib/OVMFbin/OVMF_CODE-pure-efi.fd,readonly=on \
+  -drive if=pflash,format=raw,unit=1,file=lib/OVMFbin/OVMF_VARS-pure-efi.fd \
+  -display sdl -serial stdio \
+  -no-shutdown -no-reboot
